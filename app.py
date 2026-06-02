@@ -7,6 +7,7 @@ from transformers import pipeline
 import re
 import datetime
 import os
+import time
 import google.generativeai as genai
 
 # ─── Page Config ───────────────────────────────────────────────
@@ -257,74 +258,85 @@ def run_analysis(df, sentiment_model, classifier):
         df["cluster_conf"] = [r[1] for r in results]
     return df
 
+# ─── FIX: Token-optimised prompt builder ───────────────────────
+# Root cause of 429: prompt was sending full comment text for all
+# top-5 comments per cluster (~4000-6000 tokens). Fix:
+#   1. Truncate each comment to 120 chars
+#   2. Only send top 3 comments per cluster (not 5)
+#   3. Switch to gemini-2.0-flash-lite (higher free-tier RPM)
+#   4. Add retry with exponential back-off for transient 429s
+# ───────────────────────────────────────────────────────────────
 def build_expert_report(df, gemini_key, video_context=""):
     total   = len(df)
     pos_pct = round(len(df[df["sentiment"] == "Positive"]) / total * 100, 1)
     neg_pct = round(len(df[df["sentiment"] == "Negative"]) / total * 100, 1)
     neu_pct = round(len(df[df["sentiment"] == "Neutral"])  / total * 100, 1)
+
     cluster_summary = df.groupby(["cluster", "sentiment"]).size().unstack(fill_value=0).to_string()
+
+    # ── Top 3 comments per cluster, each capped at 120 chars ──
     top_comments = ""
     for cn in CLUSTER_NAMES:
-        sub = df[df["cluster"] == cn].sort_values("likes", ascending=False).head(5)
-        top_comments += f"\n\n[{cn}]\n"
+        sub = df[df["cluster"] == cn].sort_values("likes", ascending=False).head(3)
+        top_comments += f"\n[{cn}]\n"
         for _, r in sub.iterrows():
-            top_comments += f"  - ({r['sentiment']}, {r.get('likes',0)} likes) {r['text']}\n"
-    date_info = ""
-    if "date" in df.columns:
-        date_info = f"Date range: {df['date'].min()} to {df['date'].max()}"
-    context_note = f"Video/channel context: {video_context}" if video_context.strip() else ""
+            snippet = str(r["text"])[:120].replace("\n", " ")
+            top_comments += f"  - ({r['sentiment']}, {r.get('likes', 0)} likes) {snippet}\n"
+
+    date_info    = f"Date range: {df['date'].min()} to {df['date'].max()}" if "date" in df.columns else ""
+    context_note = f"Context: {video_context.strip()}" if video_context.strip() else ""
+
     dominant_cluster = df["cluster"].value_counts().idxmax() if not df.empty else ""
     if "Military" in dominant_cluster:
-        expert_role = "a senior geopolitical and defense policy analyst specializing in public opinion around military conflicts"
+        expert_role = "a senior geopolitical and defense policy analyst"
     elif "Economic" in dominant_cluster:
-        expert_role = "a senior economic analyst specializing in consumer sentiment, inflation impact, and public reaction to economic policy"
+        expert_role = "a senior economic analyst specializing in consumer sentiment"
     elif "Electoral" in dominant_cluster:
-        expert_role = "a senior political communications strategist and electoral sentiment analyst"
+        expert_role = "a senior political communications strategist"
     else:
-        expert_role = "a senior social media intelligence analyst specializing in YouTube audience behavior"
-    prompt = f"""You are {expert_role}, with deep expertise in YouTube comment sentiment analysis and audience intelligence.
-Your task: deliver a sharp, executive-grade qualitative analysis of the comment data below.
-Write as a professional analyst briefing — authoritative, specific, and fully grounded in the data.
+        expert_role = "a senior social media intelligence analyst"
 
-## DATA DIGEST
-- Total comments analyzed: {total}
-- Sentiment split: Positive {pos_pct}% | Negative {neg_pct}% | Neutral {neu_pct}%
+    prompt = f"""You are {expert_role}. Deliver a sharp executive-grade analysis of the YouTube comment data below.
+
+DATA:
+- Comments: {total} | Positive {pos_pct}% | Negative {neg_pct}% | Neutral {neu_pct}%
 - {date_info}
 - {context_note}
 
-### Cluster x Sentiment Matrix
+Cluster x Sentiment:
 {cluster_summary}
 
-### Top Comments (by likes) per Cluster
+Top comments per cluster:
 {top_comments}
 
----
-## YOUR REPORT MUST INCLUDE EXACTLY THESE SECTIONS:
-
+Write exactly these 5 sections in clean markdown (600-900 words total):
 ### 1. Executive Summary
-One concise paragraph (4-6 sentences). What is the dominant mood? What story does this data tell?
-
 ### 2. Cluster-by-Cluster Analysis
-For each active cluster: tone, intensity, key recurring themes, notable examples from the top comments.
-
 ### 3. Audience Intent & Behavior Signals
-What actions or decisions is this audience likely to take? What are they ready to buy, support, or reject?
-
 ### 4. Risk & Opportunity Signals
-What narratives are gaining momentum? What could escalate or fade?
-
 ### 5. Business Opportunities (Top 3)
-Identify the 3 highest-priority business types that could directly benefit from advertising or positioning on videos like this.
-For each:
-- **Business type & why it fits**
-- **Specific audience insight that justifies it**
-- **One concrete action they should take**
+For section 5, for each opportunity give: business type, audience insight, one concrete action."""
 
-Write in clean markdown. Be specific. Base every claim on the provided data. Total length: 600-900 words."""
     genai.configure(api_key=gemini_key)
-    model    = genai.GenerativeModel("gemini-2.0-flash")
-    response = model.generate_content(prompt)
-    return response.text
+    # gemini-2.0-flash-lite has a higher free-tier RPM than gemini-2.0-flash
+    model = genai.GenerativeModel("gemini-2.0-flash-lite")
+
+    # Retry up to 3 times with exponential back-off on 429
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            last_error = e
+            err_str = str(e)
+            if "429" in err_str:
+                wait = (attempt + 1) * 20   # 20s, 40s, 60s
+                st.warning(f"⏳ Gemini rate limit hit — retrying in {wait}s (attempt {attempt+1}/3)…")
+                time.sleep(wait)
+            else:
+                raise e
+    raise last_error
 
 DATA_FILE = "comments_data.csv"
 
@@ -372,7 +384,7 @@ with st.sidebar:
     """)
 
 st.title("📊 YouTube Comment Intelligence")
-st.caption("Powered by RoBERTa · Zero-Shot Classification · Gemini 2.0 Flash Expert Analysis")
+st.caption("Powered by RoBERTa · Zero-Shot Classification · Gemini 2.0 Flash Lite Expert Analysis")
 st.divider()
 
 if "df" not in st.session_state:
@@ -586,11 +598,11 @@ else:
             "cluster_summary.csv", "text/csv", use_container_width=True)
 
     # ═══════════════════════════════════════════════════════════
-    #  EXPERT ANALYSIS SECTION — Gemini 2.0 Flash (Free)
+    #  EXPERT ANALYSIS SECTION — Gemini 2.0 Flash Lite (Free)
     # ═══════════════════════════════════════════════════════════
     st.divider()
     st.subheader("🤖 Expert Analyst Report")
-    st.caption("Powered by Gemini 2.0 Flash (Free API) · Dynamic Role based on dominant cluster")
+    st.caption("Powered by Gemini 2.0 Flash Lite · Token-optimised prompt · Auto-retry on rate limit")
 
     report_col, _ = st.columns([3, 1])
     with report_col:
@@ -619,7 +631,7 @@ else:
         st.markdown('<div class="report-card">', unsafe_allow_html=True)
         st.markdown(f"""
         <div class="report-meta">
-            <span class="report-badge">✦ Gemini 2.0 Flash</span>
+            <span class="report-badge">✦ Gemini 2.0 Flash Lite</span>
             <span class="report-badge" style="background:#7C3AED;">Senior Analyst</span>
             <span style="color:#64748B; font-size:13px;">{total} comments · {len(df['cluster'].unique())} clusters · dominant: {dominant_cl}</span>
         </div>
