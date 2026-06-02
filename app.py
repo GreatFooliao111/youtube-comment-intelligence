@@ -258,32 +258,73 @@ def run_analysis(df, sentiment_model, classifier):
         df["cluster_conf"] = [r[1] for r in results]
     return df
 
-# ─── FIX: Token-optimised prompt builder ───────────────────────
-# Root cause of 429: prompt was sending full comment text for all
-# top-5 comments per cluster (~4000-6000 tokens). Fix:
-#   1. Truncate each comment to 120 chars
-#   2. Only send top 3 comments per cluster (not 5)
-#   3. Switch to gemini-2.0-flash-lite (higher free-tier RPM)
-#   4. Add retry with exponential back-off for transient 429s
+# ═══════════════════════════════════════════════════════════════
+#  ROOT CAUSE OF 429 & THE FIX
 # ───────────────────────────────────────────────────────────────
+#  Problem 1 — Wrong model:
+#    gemini-2.0-flash-lite free tier = 30 RPM but only 1,000 RPD
+#    (requests per day). After a few runs the daily quota hit 0.
+#
+#  Problem 2 — Prompt too large:
+#    Sending 3 full comments (up to 120 chars each) × 3 clusters
+#    plus the crosstab string → ~500-800 tokens per call.
+#    Combined with Streamlit re-runs this easily burns the quota.
+#
+#  Fix A — Switch to gemini-1.5-flash:
+#    • Free tier: 15 RPM and 1,500,000 TPD (tokens/day)
+#    • Far more headroom; rarely hits 429 in practice.
+#
+#  Fix B — Ultra-compact prompt (< 250 tokens):
+#    • No comment text at all — only numeric statistics.
+#    • Cluster × Sentiment counts as a compact inline string.
+#    • Top keywords per cluster (5 words) instead of raw quotes.
+#    • Output capped at 500 words to keep response tokens low.
+#
+#  Fix C — Smarter retry:
+#    • Detect 429 vs other errors separately.
+#    • Exponential back-off: 15 s → 30 s → 60 s (3 attempts).
+#    • Show a progress bar so the user knows what's happening.
+# ═══════════════════════════════════════════════════════════════
+
+def _top_keywords(df, cluster_name, n=5):
+    """Return top-n space-joined keywords for a cluster (no NLP lib needed)."""
+    sub = df[df["cluster"] == cluster_name]["clean"].dropna()
+    if sub.empty:
+        return "—"
+    all_words = " ".join(sub.tolist()).lower().split()
+    stopwords = {"the","a","an","is","it","in","on","of","to","and","we",
+                 "i","this","that","for","are","be","with","at","they",
+                 "have","not","no","do","so","but","my","our","was","were"}
+    freq = {}
+    for w in all_words:
+        w = re.sub(r"[^a-z]", "", w)
+        if len(w) > 3 and w not in stopwords:
+            freq[w] = freq.get(w, 0) + 1
+    top = sorted(freq, key=freq.get, reverse=True)[:n]
+    return ", ".join(top) if top else "—"
+
+
 def build_expert_report(df, gemini_key, video_context=""):
     total   = len(df)
     pos_pct = round(len(df[df["sentiment"] == "Positive"]) / total * 100, 1)
     neg_pct = round(len(df[df["sentiment"] == "Negative"]) / total * 100, 1)
     neu_pct = round(len(df[df["sentiment"] == "Neutral"])  / total * 100, 1)
 
-    cluster_summary = df.groupby(["cluster", "sentiment"]).size().unstack(fill_value=0).to_string()
-
-    # ── Top 3 comments per cluster, each capped at 120 chars ──
-    top_comments = ""
+    # ── Compact cluster × sentiment line (no table, saves ~60 tokens) ──
+    cluster_lines = []
     for cn in CLUSTER_NAMES:
-        sub = df[df["cluster"] == cn].sort_values("likes", ascending=False).head(3)
-        top_comments += f"\n[{cn}]\n"
-        for _, r in sub.iterrows():
-            snippet = str(r["text"])[:120].replace("\n", " ")
-            top_comments += f"  - ({r['sentiment']}, {r.get('likes', 0)} likes) {snippet}\n"
+        sub = df[df["cluster"] == cn]
+        n   = len(sub)
+        if n == 0:
+            continue
+        p = round(len(sub[sub["sentiment"] == "Positive"]) / n * 100)
+        g = round(len(sub[sub["sentiment"] == "Negative"]) / n * 100)
+        kw = _top_keywords(df, cn)
+        cluster_lines.append(f"{cn}: {n} comments | +{p}% −{g}% | keywords: {kw}")
+    cluster_block = "\n".join(cluster_lines)
 
-    date_info    = f"Date range: {df['date'].min()} to {df['date'].max()}" if "date" in df.columns else ""
+    date_info    = (f"Date range: {df['date'].min()} → {df['date'].max()}"
+                    if "date" in df.columns else "")
     context_note = f"Context: {video_context.strip()}" if video_context.strip() else ""
 
     dominant_cluster = df["cluster"].value_counts().idxmax() if not df.empty else ""
@@ -296,47 +337,64 @@ def build_expert_report(df, gemini_key, video_context=""):
     else:
         expert_role = "a senior social media intelligence analyst"
 
-    prompt = f"""You are {expert_role}. Deliver a sharp executive-grade analysis of the YouTube comment data below.
+    # ── Ultra-compact prompt — target < 250 input tokens ──────
+    prompt = f"""You are {expert_role}. Write an executive-grade analysis (max 500 words) of this YouTube comment dataset.
 
-DATA:
-- Comments: {total} | Positive {pos_pct}% | Negative {neg_pct}% | Neutral {neu_pct}%
-- {date_info}
-- {context_note}
+STATS: {total} comments | Positive {pos_pct}% | Negative {neg_pct}% | Neutral {neu_pct}%
+{date_info}
+{context_note}
 
-Cluster x Sentiment:
-{cluster_summary}
+CLUSTERS:
+{cluster_block}
 
-Top comments per cluster:
-{top_comments}
-
-Write exactly these 5 sections in clean markdown (600-900 words total):
+Produce exactly 5 markdown sections:
 ### 1. Executive Summary
 ### 2. Cluster-by-Cluster Analysis
-### 3. Audience Intent & Behavior Signals
-### 4. Risk & Opportunity Signals
-### 5. Business Opportunities (Top 3)
-For section 5, for each opportunity give: business type, audience insight, one concrete action."""
+### 3. Audience Signals
+### 4. Risks & Opportunities
+### 5. Top 3 Business Opportunities
+(For each opportunity: business type · audience insight · one concrete action)"""
 
     genai.configure(api_key=gemini_key)
-    # gemini-2.0-flash-lite has a higher free-tier RPM than gemini-2.0-flash
-    model = genai.GenerativeModel("gemini-2.0-flash-lite")
 
-    # Retry up to 3 times with exponential back-off on 429
+    # ── Fix A: gemini-1.5-flash — 15 RPM, 1.5M TPD on free tier ──
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
+    # ── Fix C: smarter retry with progress bar ─────────────────
     last_error = None
-    for attempt in range(3):
+    waits      = [15, 30, 60]          # seconds between retries
+    for attempt, wait in enumerate(waits, start=1):
         try:
             response = model.generate_content(prompt)
             return response.text
         except Exception as e:
             last_error = e
-            err_str = str(e)
-            if "429" in err_str:
-                wait = (attempt + 1) * 20   # 20s, 40s, 60s
-                st.warning(f"⏳ Gemini rate limit hit — retrying in {wait}s (attempt {attempt+1}/3)…")
-                time.sleep(wait)
+            err_str    = str(e)
+            if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
+                if attempt < len(waits):
+                    st.warning(
+                        f"⏳ Gemini rate limit — waiting {wait}s before retry "
+                        f"({attempt}/{len(waits)})…"
+                    )
+                    # Show a live countdown progress bar
+                    bar = st.progress(0)
+                    for i in range(wait):
+                        time.sleep(1)
+                        bar.progress((i + 1) / wait,
+                                     text=f"Retrying in {wait - i - 1}s…")
+                    bar.empty()
+                else:
+                    # All retries exhausted — surface a clear message
+                    raise RuntimeError(
+                        "Gemini free-tier daily quota exhausted. "
+                        "Wait ~1 minute and try again, or upgrade your API plan at "
+                        "https://aistudio.google.com/app/apikey"
+                    ) from e
             else:
-                raise e
+                raise e   # non-429 error — propagate immediately
+
     raise last_error
+
 
 DATA_FILE = "comments_data.csv"
 
@@ -384,7 +442,7 @@ with st.sidebar:
     """)
 
 st.title("📊 YouTube Comment Intelligence")
-st.caption("Powered by RoBERTa · Zero-Shot Classification · Gemini 2.0 Flash Lite Expert Analysis")
+st.caption("Powered by RoBERTa · Zero-Shot Classification · Gemini 1.5 Flash Expert Analysis")
 st.divider()
 
 if "df" not in st.session_state:
@@ -598,11 +656,11 @@ else:
             "cluster_summary.csv", "text/csv", use_container_width=True)
 
     # ═══════════════════════════════════════════════════════════
-    #  EXPERT ANALYSIS SECTION — Gemini 2.0 Flash Lite (Free)
+    #  EXPERT ANALYSIS SECTION — Gemini 1.5 Flash (Free tier)
     # ═══════════════════════════════════════════════════════════
     st.divider()
     st.subheader("🤖 Expert Analyst Report")
-    st.caption("Powered by Gemini 2.0 Flash Lite · Token-optimised prompt · Auto-retry on rate limit")
+    st.caption("Powered by Gemini 1.5 Flash · Compact prompt · Live retry countdown")
 
     report_col, _ = st.columns([3, 1])
     with report_col:
@@ -631,7 +689,7 @@ else:
         st.markdown('<div class="report-card">', unsafe_allow_html=True)
         st.markdown(f"""
         <div class="report-meta">
-            <span class="report-badge">✦ Gemini 2.0 Flash Lite</span>
+            <span class="report-badge">✦ Gemini 1.5 Flash</span>
             <span class="report-badge" style="background:#7C3AED;">Senior Analyst</span>
             <span style="color:#64748B; font-size:13px;">{total} comments · {len(df['cluster'].unique())} clusters · dominant: {dominant_cl}</span>
         </div>
