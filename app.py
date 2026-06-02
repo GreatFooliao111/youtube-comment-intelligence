@@ -105,6 +105,15 @@ hr { border-color: #E2E8F0 !important; margin: 24px 0 !important; }
     padding: 20px;
     box-shadow: 0 2px 12px rgba(15,23,42,0.05);
     margin-bottom: 4px;
+    overflow: hidden;
+}
+.chart-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: #1E293B;
+    margin: 0 0 4px 2px;
+    padding: 0;
+    line-height: 1.4;
 }
 .report-card {
     background: linear-gradient(135deg, #F0FFF4 0%, #FFFFFF 100%);
@@ -183,7 +192,8 @@ def styled(fig, height=320):
         paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
         font=dict(color="#1E293B", size=13, family="Inter, sans-serif"),
         height=height,
-        margin=dict(t=36, b=20, l=16, r=16),
+        # t=8 because title is now rendered as HTML above the chart
+        margin=dict(t=8, b=20, l=16, r=16),
         legend=dict(orientation="h", yanchor="bottom", y=1.04,
                     xanchor="center", x=0.5, font=dict(size=12))
     )
@@ -261,19 +271,9 @@ def run_analysis(df, sentiment_model, classifier):
 
 # ═══════════════════════════════════════════════════════════════
 #  STRUCTURED-COMPACT PAYLOAD HELPERS
-# ───────────────────────────────────────────────────────────────
-#  Target payload: 700–1,200 tokens (rich context, free-tier safe)
-#  Six structured blocks sent to the model:
-#    1. Global dataset summary
-#    2. Per-cluster summary (count, sentiment %, avg confidence)
-#    3. Top keywords per cluster with frequency
-#    4. Representative comments per cluster (2-4, capped 200 chars)
-#    5. Outlier / high-engagement signals (top 5 by likes)
-#    6. Cross-cluster signals (dominant grievance + dominant support)
 # ═══════════════════════════════════════════════════════════════
 
 def build_cluster_summary(df):
-    """Block 2 — per-cluster statistics."""
     lines = []
     for cn in CLUSTER_NAMES:
         sub = df[df["cluster"] == cn]
@@ -293,7 +293,6 @@ def build_cluster_summary(df):
 
 
 def extract_top_keywords_with_counts(df, cluster_name, n=8):
-    """Block 3 — top keywords with frequency for a single cluster."""
     stopwords = {
         "the","a","an","is","it","in","on","of","to","and","we","i","this",
         "that","for","are","be","with","at","they","have","not","no","do",
@@ -316,14 +315,9 @@ def extract_top_keywords_with_counts(df, cluster_name, n=8):
 
 
 def select_representative_comments(df, cluster_name, n=3, max_chars=200):
-    """Block 4 — representative comments per cluster.
-    Selects n comments: highest-confidence, mixed sentiment when possible.
-    Each comment trimmed to max_chars to keep tokens under control.
-    """
     sub = df[df["cluster"] == cluster_name].copy()
     if sub.empty:
         return []
-    # Try to include at least 1 positive and 1 negative
     selected = []
     for sentiment in ["Positive", "Negative", "Neutral"]:
         pool = sub[sub["sentiment"] == sentiment].sort_values(
@@ -340,7 +334,6 @@ def select_representative_comments(df, cluster_name, n=3, max_chars=200):
                 })
         if len(selected) >= n:
             break
-    # Fill remaining slots with highest-confidence if needed
     if len(selected) < n:
         already = {s["text"] for s in selected}
         extras = sub.sort_values("cluster_conf", ascending=False)
@@ -359,7 +352,6 @@ def select_representative_comments(df, cluster_name, n=3, max_chars=200):
 
 
 def select_outlier_signals(df, n=5):
-    """Block 5 — top-n high-engagement comments by likes."""
     if "likes" not in df.columns or df.empty:
         return []
     top = df.nlargest(n, "likes")[["clean", "sentiment", "cluster", "likes"]].dropna(subset=["clean"])
@@ -377,7 +369,6 @@ def select_outlier_signals(df, n=5):
 
 
 def build_cross_cluster_signals(df):
-    """Block 6 — dominant grievance and dominant support theme."""
     neg_df = df[df["sentiment"] == "Negative"]
     pos_df = df[df["sentiment"] == "Positive"]
     dom_grievance = (
@@ -388,7 +379,6 @@ def build_cross_cluster_signals(df):
         pos_df["cluster"].value_counts().idxmax()
         if not pos_df.empty else "N/A"
     )
-    # Sentiment gap between most positive and most negative cluster
     cluster_pos_rates = {}
     for cn in CLUSTER_NAMES:
         sub = df[df["cluster"] == cn]
@@ -414,7 +404,6 @@ def build_cross_cluster_signals(df):
 
 
 def _determine_expert_role(df):
-    """Pick the most relevant analyst persona based on dominant cluster."""
     dominant = df["cluster"].value_counts().idxmax() if not df.empty else ""
     if "Military" in dominant:
         return "a senior geopolitical and defense policy analyst"
@@ -426,12 +415,6 @@ def _determine_expert_role(df):
 
 
 def build_expert_report(df, gemini_key, video_context=""):
-    """
-    Structured-compact payload builder.
-    Target: 700–1,200 input tokens, 6 structured blocks.
-    Model: gemini-1.5-flash (15 RPM, 1.5M TPD on free tier).
-    Retry: exponential back-off aware of RPM / TPM / RPD limits.
-    """
     total   = len(df)
     pos_pct = round(len(df[df["sentiment"] == "Positive"]) / total * 100, 1)
     neg_pct = round(len(df[df["sentiment"] == "Negative"]) / total * 100, 1)
@@ -441,7 +424,6 @@ def build_expert_report(df, gemini_key, video_context=""):
         if "date" in df.columns else "unknown"
     )
 
-    # ── Block 1: Global summary ─────────────────────────────────
     block1 = (
         f"Total comments: {total} | Positive: {pos_pct}% | "
         f"Negative: {neg_pct}% | Neutral: {neu_pct}% | Date range: {date_range}"
@@ -449,17 +431,14 @@ def build_expert_report(df, gemini_key, video_context=""):
     if video_context.strip():
         block1 += f"\nVideo context: {video_context.strip()}"
 
-    # ── Block 2: Cluster summaries ──────────────────────────────
     block2 = build_cluster_summary(df)
 
-    # ── Block 3: Top keywords per cluster ──────────────────────
     kw_lines = []
     for cn in CLUSTER_NAMES:
         kw = extract_top_keywords_with_counts(df, cn, n=8)
         kw_lines.append(f"• {cn}: {kw}")
     block3 = "\n".join(kw_lines)
 
-    # ── Block 4: Representative comments per cluster ────────────
     rep_lines = []
     for cn in CLUSTER_NAMES:
         reps = select_representative_comments(df, cn, n=3, max_chars=200)
@@ -471,7 +450,6 @@ def build_expert_report(df, gemini_key, video_context=""):
                 )
     block4 = "\n".join(rep_lines) if rep_lines else "No representative comments available."
 
-    # ── Block 5: Outlier / high-engagement signals ──────────────
     outliers = select_outlier_signals(df, n=5)
     if outliers:
         out_lines = []
@@ -483,7 +461,6 @@ def build_expert_report(df, gemini_key, video_context=""):
     else:
         block5 = "No high-engagement outliers detected."
 
-    # ── Block 6: Cross-cluster signals ─────────────────────────
     cross = build_cross_cluster_signals(df)
     block6 = (
         f"Dominant grievance cluster: {cross['dominant_grievance_cluster']}\n"
@@ -493,7 +470,6 @@ def build_expert_report(df, gemini_key, video_context=""):
 
     expert_role = _determine_expert_role(df)
 
-    # ── System prompt + structured user payload ─────────────────
     system_prompt = (
         f"You are {expert_role} writing for a senior strategy team.\n"
         "Rules:\n"
@@ -534,18 +510,11 @@ Write exactly these 6 sections in markdown:
 (For each: business type · key audience insight · one concrete action step)
 ### 6. Recommended Next Actions"""
 
-    # Combine system + user into a single prompt for Gemini
     full_prompt = f"{system_prompt}\n\n{user_payload}"
 
     genai.configure(api_key=gemini_key)
     model = genai.GenerativeModel("gemini-1.5-flash")
 
-    # ── Retry logic: RPM / TPM / RPD-aware back-off ─────────────
-    # Google can return 429 from any of three dimensions:
-    #   RPM  (requests per minute)  → short wait resolves it
-    #   TPM  (tokens per minute)    → short wait resolves it
-    #   RPD  (requests per day)     → resets at midnight Pacific; long wait won't help
-    # We detect RPD exhaustion from the error message and surface a clear hint.
     waits     = [15, 30, 60]
     last_error = None
     for attempt, wait in enumerate(waits, start=1):
@@ -586,7 +555,7 @@ Write exactly these 6 sections in markdown:
                         "https://aistudio.google.com/app/apikey"
                     ) from e
             else:
-                raise e  # non-rate-limit error — propagate immediately
+                raise e
 
     raise last_error
 
@@ -744,21 +713,28 @@ else:
     with tab1:
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown('<div class="chart-card">', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="chart-card">'
+                '<p class="chart-title">Sentiment Distribution</p>',
+                unsafe_allow_html=True
+            )
             sent_counts = df["sentiment"].value_counts().reset_index()
             sent_counts.columns = ["sentiment", "count"]
             fig = px.pie(sent_counts, values="count", names="sentiment",
-                         color="sentiment", color_discrete_map=SENTIMENT_COLORS,
-                         title="Sentiment Distribution")
+                         color="sentiment", color_discrete_map=SENTIMENT_COLORS)
             st.plotly_chart(styled(fig), use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
+
         with c2:
-            st.markdown('<div class="chart-card">', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="chart-card">'
+                '<p class="chart-title">Comments per Cluster</p>',
+                unsafe_allow_html=True
+            )
             clust_counts = df["cluster"].value_counts().reset_index()
             clust_counts.columns = ["cluster", "count"]
             fig2 = px.bar(clust_counts, x="cluster", y="count",
-                          color="cluster", color_discrete_map=CLUSTER_COLORS,
-                          title="Comments per Cluster")
+                          color="cluster", color_discrete_map=CLUSTER_COLORS)
             fig2.update_layout(showlegend=False)
             st.plotly_chart(styled(fig2), use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
@@ -790,7 +766,6 @@ else:
             """, unsafe_allow_html=True)
 
         st.divider()
-        # Sentiment × Cluster heatmap
         st.markdown("#### Sentiment × Cluster Heatmap")
         pivot = df.pivot_table(index="cluster", columns="sentiment",
                                values="text", aggfunc="count", fill_value=0)
