@@ -7,7 +7,7 @@ from transformers import pipeline
 import re
 import datetime
 import os
-from openai import OpenAI
+import google.generativeai as genai
 
 # ─── Page Config ───────────────────────────────────────────────
 st.set_page_config(
@@ -105,32 +105,31 @@ hr { border-color: #E2E8F0 !important; margin: 24px 0 !important; }
     box-shadow: 0 2px 12px rgba(15,23,42,0.05);
     margin-bottom: 4px;
 }
-/* ── Expert Report Card ── */
 .report-card {
-    background: linear-gradient(135deg, #F0F7FF 0%, #FFFFFF 100%);
-    border: 1px solid #BFDBFE;
-    border-left: 5px solid #2563EB;
+    background: linear-gradient(135deg, #F0FFF4 0%, #FFFFFF 100%);
+    border: 1px solid #BBF7D0;
+    border-left: 5px solid #16A34A;
     border-radius: 16px;
     padding: 28px 32px;
     margin-top: 8px;
-    box-shadow: 0 4px 24px rgba(37,99,235,0.08);
+    box-shadow: 0 4px 24px rgba(22,163,74,0.08);
     line-height: 1.75;
     color: #0F172A;
     font-size: 15px;
 }
-.report-card h3 { color: #1E40AF !important; margin-top: 20px; margin-bottom: 6px; }
-.report-card h4 { color: #1D4ED8 !important; margin-top: 14px; margin-bottom: 4px; }
+.report-card h3 { color: #15803D !important; margin-top: 20px; margin-bottom: 6px; }
+.report-card h4 { color: #16A34A !important; margin-top: 14px; margin-bottom: 4px; }
 .report-meta {
     display: flex;
     gap: 12px;
     align-items: center;
     margin-bottom: 18px;
     padding-bottom: 14px;
-    border-bottom: 1px solid #BFDBFE;
+    border-bottom: 1px solid #BBF7D0;
     flex-wrap: wrap;
 }
 .report-badge {
-    background: #2563EB;
+    background: #16A34A;
     color: white;
     border-radius: 9999px;
     padding: 3px 12px;
@@ -160,7 +159,6 @@ hr { border-color: #E2E8F0 !important; margin: 24px 0 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Color Palette ─────────────────────────────────────────────
 SENTIMENT_COLORS = {
     "Positive": "#16A34A",
     "Negative": "#DC2626",
@@ -179,7 +177,6 @@ CLUSTER_LABELS = [
     "electoral politics and party loyalty"
 ]
 
-# ─── Plotly Base Style ─────────────────────────────────────────
 def styled(fig, height=320):
     fig.update_layout(
         paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
@@ -195,7 +192,6 @@ def styled(fig, height=320):
                      zeroline=False, linecolor="#E2E8F0", tickfont=dict(size=12))
     return fig
 
-# ─── Cache: Load NLP Models ──────────────────────────────────────
 @st.cache_resource(show_spinner="Loading NLP model...")
 def load_sentiment_model():
     return pipeline("sentiment-analysis",
@@ -206,16 +202,14 @@ def load_sentiment_model():
 def load_classifier():
     return pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
 
-# ─── Helper: Clean Text ─────────────────────────────────────────
 def clean_text(text):
     if not isinstance(text, str): return None
     text = re.sub(r"http\S+", "", text)
     text = re.sub(r"@\w+", "", text)
-    text = re.sub(r"[^\w\s\'!?.,]", " ", text)
+    text = re.sub(r"[^\w\s'!?.,]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:512] if len(text) >= 3 else None
 
-# ─── Helper: Fetch YouTube Comments ────────────────────────────
 def fetch_comments(api_key, video_id, max_results=200):
     try:
         youtube = build("youtube", "v3", developerKey=api_key)
@@ -237,7 +231,6 @@ def fetch_comments(api_key, video_id, max_results=200):
         st.error(f"YouTube API Error: {e}")
         return pd.DataFrame()
 
-# ─── Helper: Classify Cluster ───────────────────────────────────
 def classify_cluster(text, classifier):
     if not text or not text.strip(): return CLUSTER_NAMES[2], 0.0
     try:
@@ -247,7 +240,6 @@ def classify_cluster(text, classifier):
     except Exception:
         return CLUSTER_NAMES[2], 0.0
 
-# ─── Helper: Run Full NLP Analysis ──────────────────────────────
 def run_analysis(df, sentiment_model, classifier):
     df["clean"] = df["text"].apply(clean_text)
     before = len(df)
@@ -265,34 +257,34 @@ def run_analysis(df, sentiment_model, classifier):
         df["cluster_conf"] = [r[1] for r in results]
     return df
 
-# ─── Helper: Build GPT Expert Report ────────────────────────────
-def build_expert_report(df, openai_key, video_context=""):
-    """Sends a structured data digest to GPT-4o and returns a markdown expert report."""
+def build_expert_report(df, gemini_key, video_context=""):
     total   = len(df)
     pos_pct = round(len(df[df["sentiment"] == "Positive"]) / total * 100, 1)
     neg_pct = round(len(df[df["sentiment"] == "Negative"]) / total * 100, 1)
     neu_pct = round(len(df[df["sentiment"] == "Neutral"])  / total * 100, 1)
-
     cluster_summary = df.groupby(["cluster", "sentiment"]).size().unstack(fill_value=0).to_string()
-
-    # Top 5 comments per cluster (most liked)
     top_comments = ""
     for cn in CLUSTER_NAMES:
         sub = df[df["cluster"] == cn].sort_values("likes", ascending=False).head(5)
         top_comments += f"\n\n[{cn}]\n"
         for _, r in sub.iterrows():
             top_comments += f"  - ({r['sentiment']}, {r.get('likes',0)} likes) {r['text']}\n"
-
-    # Date range
     date_info = ""
     if "date" in df.columns:
         date_info = f"Date range: {df['date'].min()} to {df['date'].max()}"
-
-    context_note = f"Video/channel context provided by user: {video_context}" if video_context.strip() else ""
-
-    prompt = f"""You are a senior YouTube audience intelligence analyst specializing in political and geopolitical content.
-Your role: deliver a sharp, executive-grade qualitative analysis of the comment sentiment data below.
-Your report must be written as a professional analyst briefing — authoritative, specific, and data-driven.
+    context_note = f"Video/channel context: {video_context}" if video_context.strip() else ""
+    dominant_cluster = df["cluster"].value_counts().idxmax() if not df.empty else ""
+    if "Military" in dominant_cluster:
+        expert_role = "a senior geopolitical and defense policy analyst specializing in public opinion around military conflicts"
+    elif "Economic" in dominant_cluster:
+        expert_role = "a senior economic analyst specializing in consumer sentiment, inflation impact, and public reaction to economic policy"
+    elif "Electoral" in dominant_cluster:
+        expert_role = "a senior political communications strategist and electoral sentiment analyst"
+    else:
+        expert_role = "a senior social media intelligence analyst specializing in YouTube audience behavior"
+    prompt = f"""You are {expert_role}, with deep expertise in YouTube comment sentiment analysis and audience intelligence.
+Your task: deliver a sharp, executive-grade qualitative analysis of the comment data below.
+Write as a professional analyst briefing — authoritative, specific, and fully grounded in the data.
 
 ## DATA DIGEST
 - Total comments analyzed: {total}
@@ -300,7 +292,7 @@ Your report must be written as a professional analyst briefing — authoritative
 - {date_info}
 - {context_note}
 
-### Cluster × Sentiment Matrix
+### Cluster x Sentiment Matrix
 {cluster_summary}
 
 ### Top Comments (by likes) per Cluster
@@ -313,7 +305,7 @@ Your report must be written as a professional analyst briefing — authoritative
 One concise paragraph (4-6 sentences). What is the dominant mood? What story does this data tell?
 
 ### 2. Cluster-by-Cluster Analysis
-For each active cluster: tone, intensity, key recurring themes, notable examples from top comments.
+For each active cluster: tone, intensity, key recurring themes, notable examples from the top comments.
 
 ### 3. Audience Intent & Behavior Signals
 What actions or decisions is this audience likely to take? What are they ready to buy, support, or reject?
@@ -323,26 +315,17 @@ What narratives are gaining momentum? What could escalate or fade?
 
 ### 5. Business Opportunities (Top 3)
 Identify the 3 highest-priority business types that could directly benefit from advertising or positioning on videos like this.
-For each business:
-- Business type & why it fits
-- Specific audience insight that justifies it
-- One concrete action they should take
+For each:
+- **Business type & why it fits**
+- **Specific audience insight that justifies it**
+- **One concrete action they should take**
 
-Write in clean markdown. Be specific. Do not use vague language. Base every claim on the data provided."""
+Write in clean markdown. Be specific. Base every claim on the provided data. Total length: 600-900 words."""
+    genai.configure(api_key=gemini_key)
+    model    = genai.GenerativeModel("gemini-2.0-flash")
+    response = model.generate_content(prompt)
+    return response.text
 
-    client   = OpenAI(api_key=openai_key)
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "You are a senior YouTube audience intelligence analyst. Write concise, data-driven executive reports."},
-            {"role": "user",   "content": prompt}
-        ],
-        temperature=0.4,
-        max_tokens=1800
-    )
-    return response.choices[0].message.content
-
-# ─── Helper: Save / Load ───────────────────────────────────────
 DATA_FILE = "comments_data.csv"
 
 def save_data(df):
@@ -355,9 +338,6 @@ def load_saved_data():
     if os.path.exists(DATA_FILE): return pd.read_csv(DATA_FILE)
     return pd.DataFrame()
 
-# ═══════════════════════════════════════════════════════════════
-#  SIDEBAR
-# ═══════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("## ⚙️ Configuration")
     api_key      = st.text_input("YouTube API Key", type="password",
@@ -373,9 +353,9 @@ with st.sidebar:
     st.markdown("### 🧪 Demo Mode")
     demo_btn     = st.button("▶️ Run with Sample Data", use_container_width=True)
     st.divider()
-    st.markdown("### 🤖 Expert Analysis (GPT-4o)")
-    openai_key   = st.text_input("OpenAI API Key", type="password",
-                      help="Required for the AI expert report section")
+    st.markdown("### 🤖 Expert Analysis (Gemini)")
+    gemini_key   = st.text_input("Google Gemini API Key", type="password",
+                      help="Free key from aistudio.google.com/app/apikey")
     video_context = st.text_area(
         "Video / Channel Context (optional)",
         placeholder="e.g. Fox News segment on Iran nuclear talks, June 2026...",
@@ -388,14 +368,11 @@ with st.sidebar:
     1. Enter your YouTube API Key
     2. Paste any YouTube video URL
     3. Click Fetch & Analyze
-    4. Add OpenAI key for expert report
+    4. Add Gemini key for expert report
     """)
 
-# ═══════════════════════════════════════════════════════════════
-#  MAIN TITLE
-# ═══════════════════════════════════════════════════════════════
 st.title("📊 YouTube Comment Intelligence")
-st.caption("Powered by RoBERTa · Zero-Shot Classification · GPT-4o Expert Analysis")
+st.caption("Powered by RoBERTa · Zero-Shot Classification · Gemini 2.0 Flash Expert Analysis")
 st.divider()
 
 if "df" not in st.session_state:
@@ -403,7 +380,6 @@ if "df" not in st.session_state:
 if "expert_report" not in st.session_state:
     st.session_state.expert_report = ""
 
-# ─── Demo Data ─────────────────────────────────────────────────
 DEMO_COMMENTS = [
     {"text": "We need to resume military action and finish the job completely", "likes": 312, "date": "2026-05-10"},
     {"text": "FINISH the job! No more half measures, total victory only",        "likes": 289, "date": "2026-05-10"},
@@ -432,7 +408,6 @@ DEMO_COMMENTS = [
     {"text": "Energy independence was promised and now look at these prices",     "likes": 223, "date": "2026-05-14"},
 ]
 
-# ─── Triggers ──────────────────────────────────────────────────
 if demo_btn:
     st.info("Running in Demo Mode with sample comments...")
     df_demo = pd.DataFrame(DEMO_COMMENTS)
@@ -472,9 +447,6 @@ if fetch_btn:
                 st.session_state.df = df_new
                 st.session_state.expert_report = ""
 
-# ═══════════════════════════════════════════════════════════════
-#  DASHBOARD
-# ═══════════════════════════════════════════════════════════════
 df = st.session_state.df
 
 if df.empty:
@@ -492,7 +464,6 @@ else:
     neu            = len(df[df["sentiment"] == "Neutral"])
     cluster_counts = df["cluster"].value_counts()
 
-    # ── KPI Row ────────────────────────────────────────────────
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Total Comments", total)
     k2.metric("Positive 🟢",    pos, f"↑ {pos/total*100:.0f}%")
@@ -502,10 +473,8 @@ else:
     dom_parts = dominant.split(" ", 1)
     dom_label = dom_parts[1] if len(dom_parts) > 1 else dominant
     k5.metric("Dominant Cluster", dom_label)
-
     st.divider()
 
-    # ── Row 1: Sentiment Donut + Cluster Bar ───────────────────
     col1, col2 = st.columns(2)
     with col1:
         st.markdown('<div class="chart-card">', unsafe_allow_html=True)
@@ -545,9 +514,8 @@ else:
         st.plotly_chart(fig_cluster, use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Row 2: Stacked Bar ───────────────────────────────────────
     st.markdown('<div class="chart-card">', unsafe_allow_html=True)
-    st.markdown("**Cluster × Sentiment Breakdown**")
+    st.markdown("**Cluster x Sentiment Breakdown**")
     cross = pd.crosstab(df["cluster"], df["sentiment"]).reset_index()
     for c in ["Positive", "Negative", "Neutral"]:
         if c not in cross.columns: cross[c] = 0
@@ -565,7 +533,6 @@ else:
     st.plotly_chart(fig_stack, use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Row 3: Timeline ──────────────────────────────────────────
     if "date" in df.columns:
         st.markdown('<div class="chart-card">', unsafe_allow_html=True)
         st.markdown("**Activity Timeline by Cluster**")
@@ -584,7 +551,6 @@ else:
         st.plotly_chart(fig_time, use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # ── Top Comments ───────────────────────────────────────────
     st.divider()
     st.subheader("🔍 Top Comments by Cluster")
     tab1, tab2, tab3 = st.tabs(CLUSTER_NAMES)
@@ -606,7 +572,6 @@ else:
                 </div>
                 """, unsafe_allow_html=True)
 
-    # ── Export ─────────────────────────────────────────────────
     st.divider()
     st.subheader("📥 Export Results")
     col_dl1, col_dl2 = st.columns(2)
@@ -620,12 +585,12 @@ else:
         st.download_button("⬇️ Download Summary CSV", summary_csv,
             "cluster_summary.csv", "text/csv", use_container_width=True)
 
-    # ═══════════════════════════════════════════════════════════════
-    #  EXPERT ANALYSIS SECTION (GPT-4o)
-    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════
+    #  EXPERT ANALYSIS SECTION — Gemini 2.0 Flash (Free)
+    # ═══════════════════════════════════════════════════════════
     st.divider()
     st.subheader("🤖 Expert Analyst Report")
-    st.caption("Powered by GPT-4o · Role: Senior YouTube Audience Intelligence Analyst")
+    st.caption("Powered by Gemini 2.0 Flash (Free API) · Dynamic Role based on dominant cluster")
 
     report_col, _ = st.columns([3, 1])
     with report_col:
@@ -633,36 +598,34 @@ else:
             "✨ Generate Expert Report",
             type="primary",
             use_container_width=True,
-            disabled=(not openai_key),
-            help="Add your OpenAI API Key in the sidebar to enable this feature."
+            disabled=(not gemini_key),
+            help="Add your Gemini API Key in the sidebar to enable this feature."
         )
 
-    if not openai_key:
-        st.info("🔑 Add your OpenAI API Key in the sidebar to unlock the expert analysis report.")
+    if not gemini_key:
+        st.info("🔑 Add your free **Google Gemini API Key** in the sidebar to unlock the expert report.  \nGet it free at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)")
 
-    if generate_btn and openai_key:
+    if generate_btn and gemini_key:
         with st.spinner("🤖 Analyst is reading the data and writing the report..."):
             try:
-                report = build_expert_report(df, openai_key, video_context)
+                report = build_expert_report(df, gemini_key, video_context)
                 st.session_state.expert_report = report
             except Exception as e:
-                st.error(f"OpenAI error: {e}")
+                st.error(f"Gemini API error: {e}")
 
     if st.session_state.expert_report:
         report_text = st.session_state.expert_report
-        # Render inside styled card
+        dominant_cl = df["cluster"].value_counts().idxmax() if not df.empty else "General"
         st.markdown('<div class="report-card">', unsafe_allow_html=True)
         st.markdown(f"""
         <div class="report-meta">
-            <span class="report-badge">🤖 GPT-4o</span>
-            <span class="report-badge" style="background:#16A34A;">Senior Analyst</span>
-            <span style="color:#64748B; font-size:13px;">{total} comments · {len(df['cluster'].unique())} clusters</span>
+            <span class="report-badge">✦ Gemini 2.0 Flash</span>
+            <span class="report-badge" style="background:#7C3AED;">Senior Analyst</span>
+            <span style="color:#64748B; font-size:13px;">{total} comments · {len(df['cluster'].unique())} clusters · dominant: {dominant_cl}</span>
         </div>
         """, unsafe_allow_html=True)
         st.markdown(report_text)
         st.markdown('</div>', unsafe_allow_html=True)
-
-        # Download report as .md
         st.download_button(
             label="⬇️ Download Report (.md)",
             data=report_text.encode("utf-8"),
