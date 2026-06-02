@@ -102,18 +102,10 @@ hr { border-color: #E2E8F0 !important; margin: 24px 0 !important; }
     background: #FFFFFF;
     border: 1px solid #E2E8F0;
     border-radius: 16px;
-    padding: 20px;
+    padding: 4px 20px 20px 20px;
     box-shadow: 0 2px 12px rgba(15,23,42,0.05);
     margin-bottom: 4px;
     overflow: hidden;
-}
-.chart-title {
-    font-size: 15px;
-    font-weight: 700;
-    color: #1E293B;
-    margin: 0 0 4px 2px;
-    padding: 0;
-    line-height: 1.4;
 }
 .report-card {
     background: linear-gradient(135deg, #F0FFF4 0%, #FFFFFF 100%);
@@ -187,16 +179,25 @@ CLUSTER_LABELS = [
     "electoral politics and party loyalty"
 ]
 
-def styled(fig, height=320):
-    fig.update_layout(
+def styled(fig, height=320, title=None):
+    layout_kwargs = dict(
         paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
         font=dict(color="#1E293B", size=13, family="Inter, sans-serif"),
         height=height,
-        # t=8 because title is now rendered as HTML above the chart
-        margin=dict(t=8, b=20, l=16, r=16),
+        margin=dict(t=48 if title else 12, b=20, l=16, r=16),
         legend=dict(orientation="h", yanchor="bottom", y=1.04,
                     xanchor="center", x=0.5, font=dict(size=12))
     )
+    if title:
+        layout_kwargs["title"] = dict(
+            text=title,
+            font=dict(size=15, weight=700, color="#1E293B"),
+            x=0,
+            xanchor="left",
+            xref="paper",
+            pad=dict(l=4, t=4)
+        )
+    fig.update_layout(**layout_kwargs)
     fig.update_xaxes(showgrid=True, gridcolor="rgba(148,163,184,0.18)",
                      zeroline=False, linecolor="#E2E8F0", tickfont=dict(size=12))
     fig.update_yaxes(showgrid=True, gridcolor="rgba(148,163,184,0.18)",
@@ -713,30 +714,28 @@ else:
     with tab1:
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown(
-                '<div class="chart-card">'
-                '<p class="chart-title">Sentiment Distribution</p>',
-                unsafe_allow_html=True
-            )
+            st.markdown('<div class="chart-card">', unsafe_allow_html=True)
             sent_counts = df["sentiment"].value_counts().reset_index()
             sent_counts.columns = ["sentiment", "count"]
             fig = px.pie(sent_counts, values="count", names="sentiment",
                          color="sentiment", color_discrete_map=SENTIMENT_COLORS)
-            st.plotly_chart(styled(fig), use_container_width=True)
+            st.plotly_chart(
+                styled(fig, title="Sentiment Distribution"),
+                use_container_width=True
+            )
             st.markdown('</div>', unsafe_allow_html=True)
 
         with c2:
-            st.markdown(
-                '<div class="chart-card">'
-                '<p class="chart-title">Comments per Cluster</p>',
-                unsafe_allow_html=True
-            )
+            st.markdown('<div class="chart-card">', unsafe_allow_html=True)
             clust_counts = df["cluster"].value_counts().reset_index()
             clust_counts.columns = ["cluster", "count"]
             fig2 = px.bar(clust_counts, x="cluster", y="count",
                           color="cluster", color_discrete_map=CLUSTER_COLORS)
             fig2.update_layout(showlegend=False)
-            st.plotly_chart(styled(fig2), use_container_width=True)
+            st.plotly_chart(
+                styled(fig2, title="Comments per Cluster"),
+                use_container_width=True
+            )
             st.markdown('</div>', unsafe_allow_html=True)
 
         # ── Download ──────────────────────────────────────────
