@@ -258,125 +258,321 @@ def run_analysis(df, sentiment_model, classifier):
         df["cluster_conf"] = [r[1] for r in results]
     return df
 
+
 # ═══════════════════════════════════════════════════════════════
-#  ROOT CAUSE OF 429 & THE FIX
+#  STRUCTURED-COMPACT PAYLOAD HELPERS
 # ───────────────────────────────────────────────────────────────
-#  Problem 1 — Wrong model:
-#    gemini-2.0-flash-lite free tier = 30 RPM but only 1,000 RPD
-#    (requests per day). After a few runs the daily quota hit 0.
-#
-#  Problem 2 — Prompt too large:
-#    Sending 3 full comments (up to 120 chars each) × 3 clusters
-#    plus the crosstab string → ~500-800 tokens per call.
-#    Combined with Streamlit re-runs this easily burns the quota.
-#
-#  Fix A — Switch to gemini-1.5-flash:
-#    • Free tier: 15 RPM and 1,500,000 TPD (tokens/day)
-#    • Far more headroom; rarely hits 429 in practice.
-#
-#  Fix B — Ultra-compact prompt (< 250 tokens):
-#    • No comment text at all — only numeric statistics.
-#    • Cluster × Sentiment counts as a compact inline string.
-#    • Top keywords per cluster (5 words) instead of raw quotes.
-#    • Output capped at 500 words to keep response tokens low.
-#
-#  Fix C — Smarter retry:
-#    • Detect 429 vs other errors separately.
-#    • Exponential back-off: 15 s → 30 s → 60 s (3 attempts).
-#    • Show a progress bar so the user knows what's happening.
+#  Target payload: 700–1,200 tokens (rich context, free-tier safe)
+#  Six structured blocks sent to the model:
+#    1. Global dataset summary
+#    2. Per-cluster summary (count, sentiment %, avg confidence)
+#    3. Top keywords per cluster with frequency
+#    4. Representative comments per cluster (2-4, capped 200 chars)
+#    5. Outlier / high-engagement signals (top 5 by likes)
+#    6. Cross-cluster signals (dominant grievance + dominant support)
 # ═══════════════════════════════════════════════════════════════
 
-def _top_keywords(df, cluster_name, n=5):
-    """Return top-n space-joined keywords for a cluster (no NLP lib needed)."""
+def build_cluster_summary(df):
+    """Block 2 — per-cluster statistics."""
+    lines = []
+    for cn in CLUSTER_NAMES:
+        sub = df[df["cluster"] == cn]
+        n = len(sub)
+        if n == 0:
+            continue
+        pos = round(len(sub[sub["sentiment"] == "Positive"]) / n * 100)
+        neg = round(len(sub[sub["sentiment"] == "Negative"]) / n * 100)
+        neu = 100 - pos - neg
+        avg_conf = round(sub["cluster_conf"].mean(), 2) if "cluster_conf" in sub else "N/A"
+        share = round(n / len(df) * 100, 1)
+        lines.append(
+            f"• {cn}: {n} comments ({share}% of total) | "
+            f"+{pos}% pos / -{neg}% neg / ~{neu}% neu | avg confidence: {avg_conf}"
+        )
+    return "\n".join(lines)
+
+
+def extract_top_keywords_with_counts(df, cluster_name, n=8):
+    """Block 3 — top keywords with frequency for a single cluster."""
+    stopwords = {
+        "the","a","an","is","it","in","on","of","to","and","we","i","this",
+        "that","for","are","be","with","at","they","have","not","no","do",
+        "so","but","my","our","was","were","he","she","his","her","you",
+        "your","its","who","what","just","get","got","been","will","can",
+        "us","im","dont","its","thats","would","could","should","really",
+        "about","more","than","also","like","very","all","from","one","has"
+    }
     sub = df[df["cluster"] == cluster_name]["clean"].dropna()
     if sub.empty:
         return "—"
-    all_words = " ".join(sub.tolist()).lower().split()
-    stopwords = {"the","a","an","is","it","in","on","of","to","and","we",
-                 "i","this","that","for","are","be","with","at","they",
-                 "have","not","no","do","so","but","my","our","was","were"}
     freq = {}
-    for w in all_words:
-        w = re.sub(r"[^a-z]", "", w)
-        if len(w) > 3 and w not in stopwords:
-            freq[w] = freq.get(w, 0) + 1
+    for text in sub:
+        for w in text.lower().split():
+            w = re.sub(r"[^a-z]", "", w)
+            if len(w) > 3 and w not in stopwords:
+                freq[w] = freq.get(w, 0) + 1
     top = sorted(freq, key=freq.get, reverse=True)[:n]
-    return ", ".join(top) if top else "—"
+    return ", ".join(f"{w}({freq[w]})" for w in top) if top else "—"
+
+
+def select_representative_comments(df, cluster_name, n=3, max_chars=200):
+    """Block 4 — representative comments per cluster.
+    Selects n comments: highest-confidence, mixed sentiment when possible.
+    Each comment trimmed to max_chars to keep tokens under control.
+    """
+    sub = df[df["cluster"] == cluster_name].copy()
+    if sub.empty:
+        return []
+    # Try to include at least 1 positive and 1 negative
+    selected = []
+    for sentiment in ["Positive", "Negative", "Neutral"]:
+        pool = sub[sub["sentiment"] == sentiment].sort_values(
+            "cluster_conf", ascending=False
+        )
+        if not pool.empty:
+            row = pool.iloc[0]
+            text = str(row["clean"])[:max_chars].strip()
+            if text:
+                selected.append({
+                    "text": text,
+                    "sentiment": row["sentiment"],
+                    "likes": int(row.get("likes", 0))
+                })
+        if len(selected) >= n:
+            break
+    # Fill remaining slots with highest-confidence if needed
+    if len(selected) < n:
+        already = {s["text"] for s in selected}
+        extras = sub.sort_values("cluster_conf", ascending=False)
+        for _, row in extras.iterrows():
+            text = str(row["clean"])[:max_chars].strip()
+            if text not in already:
+                selected.append({
+                    "text": text,
+                    "sentiment": row["sentiment"],
+                    "likes": int(row.get("likes", 0))
+                })
+                already.add(text)
+            if len(selected) >= n:
+                break
+    return selected
+
+
+def select_outlier_signals(df, n=5):
+    """Block 5 — top-n high-engagement comments by likes."""
+    if "likes" not in df.columns or df.empty:
+        return []
+    top = df.nlargest(n, "likes")[["clean", "sentiment", "cluster", "likes"]].dropna(subset=["clean"])
+    result = []
+    for _, row in top.iterrows():
+        text = str(row["clean"])[:200].strip()
+        if text:
+            result.append({
+                "text": text,
+                "sentiment": row["sentiment"],
+                "cluster": row["cluster"],
+                "likes": int(row["likes"])
+            })
+    return result
+
+
+def build_cross_cluster_signals(df):
+    """Block 6 — dominant grievance and dominant support theme."""
+    neg_df = df[df["sentiment"] == "Negative"]
+    pos_df = df[df["sentiment"] == "Positive"]
+    dom_grievance = (
+        neg_df["cluster"].value_counts().idxmax()
+        if not neg_df.empty else "N/A"
+    )
+    dom_support = (
+        pos_df["cluster"].value_counts().idxmax()
+        if not pos_df.empty else "N/A"
+    )
+    # Sentiment gap between most positive and most negative cluster
+    cluster_pos_rates = {}
+    for cn in CLUSTER_NAMES:
+        sub = df[df["cluster"] == cn]
+        if len(sub) > 0:
+            cluster_pos_rates[cn] = round(
+                len(sub[sub["sentiment"] == "Positive"]) / len(sub) * 100, 1
+            )
+    if len(cluster_pos_rates) >= 2:
+        best = max(cluster_pos_rates, key=cluster_pos_rates.get)
+        worst = min(cluster_pos_rates, key=cluster_pos_rates.get)
+        gap = cluster_pos_rates[best] - cluster_pos_rates[worst]
+        gap_note = (
+            f"Sentiment gap: {best} ({cluster_pos_rates[best]}% pos) vs "
+            f"{worst} ({cluster_pos_rates[worst]}% pos) — Δ{gap:.1f}pp"
+        )
+    else:
+        gap_note = "Insufficient clusters for gap analysis."
+    return {
+        "dominant_grievance_cluster": dom_grievance,
+        "dominant_support_cluster": dom_support,
+        "sentiment_gap": gap_note
+    }
+
+
+def _determine_expert_role(df):
+    """Pick the most relevant analyst persona based on dominant cluster."""
+    dominant = df["cluster"].value_counts().idxmax() if not df.empty else ""
+    if "Military" in dominant:
+        return "a senior geopolitical and defense policy analyst"
+    elif "Economic" in dominant:
+        return "a senior economic analyst specializing in consumer sentiment"
+    elif "Electoral" in dominant:
+        return "a senior political communications strategist"
+    return "a senior social media intelligence analyst"
 
 
 def build_expert_report(df, gemini_key, video_context=""):
+    """
+    Structured-compact payload builder.
+    Target: 700–1,200 input tokens, 6 structured blocks.
+    Model: gemini-1.5-flash (15 RPM, 1.5M TPD on free tier).
+    Retry: exponential back-off aware of RPM / TPM / RPD limits.
+    """
     total   = len(df)
     pos_pct = round(len(df[df["sentiment"] == "Positive"]) / total * 100, 1)
     neg_pct = round(len(df[df["sentiment"] == "Negative"]) / total * 100, 1)
     neu_pct = round(len(df[df["sentiment"] == "Neutral"])  / total * 100, 1)
+    date_range = (
+        f"{df['date'].min()} → {df['date'].max()}"
+        if "date" in df.columns else "unknown"
+    )
 
-    # ── Compact cluster × sentiment line (no table, saves ~60 tokens) ──
-    cluster_lines = []
+    # ── Block 1: Global summary ─────────────────────────────────
+    block1 = (
+        f"Total comments: {total} | Positive: {pos_pct}% | "
+        f"Negative: {neg_pct}% | Neutral: {neu_pct}% | Date range: {date_range}"
+    )
+    if video_context.strip():
+        block1 += f"\nVideo context: {video_context.strip()}"
+
+    # ── Block 2: Cluster summaries ──────────────────────────────
+    block2 = build_cluster_summary(df)
+
+    # ── Block 3: Top keywords per cluster ──────────────────────
+    kw_lines = []
     for cn in CLUSTER_NAMES:
-        sub = df[df["cluster"] == cn]
-        n   = len(sub)
-        if n == 0:
-            continue
-        p = round(len(sub[sub["sentiment"] == "Positive"]) / n * 100)
-        g = round(len(sub[sub["sentiment"] == "Negative"]) / n * 100)
-        kw = _top_keywords(df, cn)
-        cluster_lines.append(f"{cn}: {n} comments | +{p}% −{g}% | keywords: {kw}")
-    cluster_block = "\n".join(cluster_lines)
+        kw = extract_top_keywords_with_counts(df, cn, n=8)
+        kw_lines.append(f"• {cn}: {kw}")
+    block3 = "\n".join(kw_lines)
 
-    date_info    = (f"Date range: {df['date'].min()} → {df['date'].max()}"
-                    if "date" in df.columns else "")
-    context_note = f"Context: {video_context.strip()}" if video_context.strip() else ""
+    # ── Block 4: Representative comments per cluster ────────────
+    rep_lines = []
+    for cn in CLUSTER_NAMES:
+        reps = select_representative_comments(df, cn, n=3, max_chars=200)
+        if reps:
+            rep_lines.append(f"\n{cn}:")
+            for r in reps:
+                rep_lines.append(
+                    f'  [{r["sentiment"]} | ❤️{r["likes"]}] "{r["text"]}"'
+                )
+    block4 = "\n".join(rep_lines) if rep_lines else "No representative comments available."
 
-    dominant_cluster = df["cluster"].value_counts().idxmax() if not df.empty else ""
-    if "Military" in dominant_cluster:
-        expert_role = "a senior geopolitical and defense policy analyst"
-    elif "Economic" in dominant_cluster:
-        expert_role = "a senior economic analyst specializing in consumer sentiment"
-    elif "Electoral" in dominant_cluster:
-        expert_role = "a senior political communications strategist"
+    # ── Block 5: Outlier / high-engagement signals ──────────────
+    outliers = select_outlier_signals(df, n=5)
+    if outliers:
+        out_lines = []
+        for o in outliers:
+            out_lines.append(
+                f'  [{o["cluster"]} | {o["sentiment"]} | ❤️{o["likes"]}] "{o["text"]}"'
+            )
+        block5 = "\n".join(out_lines)
     else:
-        expert_role = "a senior social media intelligence analyst"
+        block5 = "No high-engagement outliers detected."
 
-    # ── Ultra-compact prompt — target < 250 input tokens ──────
-    prompt = f"""You are {expert_role}. Write an executive-grade analysis (max 500 words) of this YouTube comment dataset.
+    # ── Block 6: Cross-cluster signals ─────────────────────────
+    cross = build_cross_cluster_signals(df)
+    block6 = (
+        f"Dominant grievance cluster: {cross['dominant_grievance_cluster']}\n"
+        f"Dominant support cluster: {cross['dominant_support_cluster']}\n"
+        f"{cross['sentiment_gap']}"
+    )
 
-STATS: {total} comments | Positive {pos_pct}% | Negative {neg_pct}% | Neutral {neu_pct}%
-{date_info}
-{context_note}
+    expert_role = _determine_expert_role(df)
 
-CLUSTERS:
-{cluster_block}
+    # ── System prompt + structured user payload ─────────────────
+    system_prompt = (
+        f"You are {expert_role} writing for a senior strategy team.\n"
+        "Rules:\n"
+        "- Use ONLY the data provided below. Do not invent events, demographics, or motives.\n"
+        "- Clearly separate direct observations (what the data shows) from inferences (what it implies).\n"
+        "- Prioritize contradictions, emotional intensity, and cross-cluster tensions over majority sentiment.\n"
+        "- Focus on actionable market and communications signals.\n"
+        "- Write in concise, high-value markdown. Avoid filler phrases.\n"
+        "- Do not exceed 600 words in your response."
+    )
 
-Produce exactly 5 markdown sections:
+    user_payload = f"""Analyze this YouTube comment intelligence summary.
+
+[GLOBAL SUMMARY]
+{block1}
+
+[CLUSTER SUMMARIES]
+{block2}
+
+[TOP KEYWORDS PER CLUSTER]
+{block3}
+
+[REPRESENTATIVE COMMENTS]
+{block4}
+
+[HIGH-ENGAGEMENT OUTLIERS]
+{block5}
+
+[CROSS-CLUSTER SIGNALS]
+{block6}
+
+Write exactly these 6 sections in markdown:
 ### 1. Executive Summary
-### 2. Cluster-by-Cluster Analysis
-### 3. Audience Signals
-### 4. Risks & Opportunities
+### 2. What the Audience Cares About
+### 3. Cluster-by-Cluster Dynamics
+### 4. Risks, Tensions & Opportunity Windows
 ### 5. Top 3 Business Opportunities
-(For each opportunity: business type · audience insight · one concrete action)"""
+(For each: business type · key audience insight · one concrete action step)
+### 6. Recommended Next Actions"""
+
+    # Combine system + user into a single prompt for Gemini
+    full_prompt = f"{system_prompt}\n\n{user_payload}"
 
     genai.configure(api_key=gemini_key)
-
-    # ── Fix A: gemini-1.5-flash — 15 RPM, 1.5M TPD on free tier ──
     model = genai.GenerativeModel("gemini-1.5-flash")
 
-    # ── Fix C: smarter retry with progress bar ─────────────────
+    # ── Retry logic: RPM / TPM / RPD-aware back-off ─────────────
+    # Google can return 429 from any of three dimensions:
+    #   RPM  (requests per minute)  → short wait resolves it
+    #   TPM  (tokens per minute)    → short wait resolves it
+    #   RPD  (requests per day)     → resets at midnight Pacific; long wait won't help
+    # We detect RPD exhaustion from the error message and surface a clear hint.
+    waits     = [15, 30, 60]
     last_error = None
-    waits      = [15, 30, 60]          # seconds between retries
     for attempt, wait in enumerate(waits, start=1):
         try:
-            response = model.generate_content(prompt)
+            response = model.generate_content(full_prompt)
             return response.text
         except Exception as e:
             last_error = e
-            err_str    = str(e)
-            if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
+            err_str    = str(e).lower()
+            is_rate    = "429" in str(e) or "quota" in err_str or "rate" in err_str
+            is_rpd     = "daily" in err_str or "per day" in err_str or "rpd" in err_str
+
+            if is_rate:
+                if is_rpd:
+                    raise RuntimeError(
+                        "🚫 Gemini **daily quota (RPD)** exhausted for this project.\n\n"
+                        "This quota resets at **midnight Pacific Time** (not UTC).\n"
+                        "Switching API keys will NOT help — quotas are per project.\n"
+                        "Options:\n"
+                        "• Wait until midnight PT and try again.\n"
+                        "• Upgrade your plan at https://aistudio.google.com/app/apikey"
+                    ) from e
                 if attempt < len(waits):
                     st.warning(
-                        f"⏳ Gemini rate limit — waiting {wait}s before retry "
+                        f"⏳ Gemini rate limit (RPM/TPM) — waiting {wait}s before retry "
                         f"({attempt}/{len(waits)})…"
                     )
-                    # Show a live countdown progress bar
                     bar = st.progress(0)
                     for i in range(wait):
                         time.sleep(1)
@@ -384,14 +580,13 @@ Produce exactly 5 markdown sections:
                                      text=f"Retrying in {wait - i - 1}s…")
                     bar.empty()
                 else:
-                    # All retries exhausted — surface a clear message
                     raise RuntimeError(
-                        "Gemini free-tier daily quota exhausted. "
-                        "Wait ~1 minute and try again, or upgrade your API plan at "
+                        "⏱️ Gemini rate limit persists after 3 retries (RPM/TPM).\n"
+                        "Wait ~1 minute and try again, or check your quota at "
                         "https://aistudio.google.com/app/apikey"
                     ) from e
             else:
-                raise e   # non-429 error — propagate immediately
+                raise e  # non-rate-limit error — propagate immediately
 
     raise last_error
 
@@ -451,255 +646,215 @@ if "expert_report" not in st.session_state:
     st.session_state.expert_report = ""
 
 DEMO_COMMENTS = [
-    {"text": "We need to resume military action and finish the job completely", "likes": 312, "date": "2026-05-10"},
-    {"text": "FINISH the job! No more half measures, total victory only",        "likes": 289, "date": "2026-05-10"},
-    {"text": "The military option is the only language they understand",          "likes": 201, "date": "2026-05-11"},
-    {"text": "Strike hard and fast, no negotiations with terrorists",             "likes": 178, "date": "2026-05-11"},
-    {"text": "We should have bombed them back to stone age already",              "likes": 156, "date": "2026-05-12"},
-    {"text": "Lower energy cost is what we need, not another war",               "likes": 445, "date": "2026-05-10"},
-    {"text": "Nightmare happening in America with the price of oil and gas",      "likes": 398, "date": "2026-05-10"},
-    {"text": "My grocery bill doubled, I dont care about foreign wars",           "likes": 356, "date": "2026-05-11"},
-    {"text": "Focus on American jobs and economy, not overseas conflicts",        "likes": 321, "date": "2026-05-11"},
-    {"text": "Inflation is killing us, this war just makes everything worse",     "likes": 289, "date": "2026-05-12"},
-    {"text": "American families are struggling and we are spending billions abroad","likes": 267, "date": "2026-05-12"},
-    {"text": "The dems get control back we are so screwed",                       "likes": 534, "date": "2026-05-10"},
-    {"text": "I have lost faith in Trump on this issue honestly",                 "likes": 478, "date": "2026-05-10"},
-    {"text": "Republicans better get their act together before midterms",          "likes": 412, "date": "2026-05-11"},
-    {"text": "If GOP loses the house it is over for America",                     "likes": 389, "date": "2026-05-11"},
-    {"text": "This will cost us the election in November mark my words",          "likes": 345, "date": "2026-05-12"},
-    {"text": "Trump needs to stop listening to the warmongers in his cabinet",    "likes": 298, "date": "2026-05-12"},
-    {"text": "I voted for peace not another endless war in Middle East",          "likes": 267, "date": "2026-05-13"},
-    {"text": "Great leadership, this is exactly what America needed to show strength","likes": 189, "date": "2026-05-10"},
-    {"text": "Strong response was necessary, Iran had to be stopped",             "likes": 167, "date": "2026-05-11"},
-    {"text": "Gas prices are going through the roof because of this conflict",    "likes": 234, "date": "2026-05-11"},
-    {"text": "We should protect our borders first before foreign adventures",     "likes": 198, "date": "2026-05-12"},
-    {"text": "The base is fracturing, this is dangerous for the party",           "likes": 312, "date": "2026-05-13"},
-    {"text": "Complete mission then come home, no nation building this time",     "likes": 145, "date": "2026-05-13"},
-    {"text": "Energy independence was promised and now look at these prices",     "likes": 223, "date": "2026-05-14"},
+    {"text": "We need to resume military action and finish the job completely", "likes": 312, "date": "2026-05-01"},
+    {"text": "The ceasefire was a mistake, we should never have agreed to it", "likes": 289, "date": "2026-05-01"},
+    {"text": "Our soldiers are heroes and deserve full support from the government", "likes": 445, "date": "2026-05-02"},
+    {"text": "Stop the war now, too many innocent people are dying every day", "likes": 178, "date": "2026-05-02"},
+    {"text": "The military leadership has no clue what they are doing", "likes": 134, "date": "2026-05-03"},
+    {"text": "Inflation is destroying middle class families and nobody cares", "likes": 567, "date": "2026-05-03"},
+    {"text": "I cannot afford groceries anymore, this government has failed us", "likes": 612, "date": "2026-05-04"},
+    {"text": "Gas prices are through the roof and wages have not moved in years", "likes": 398, "date": "2026-05-04"},
+    {"text": "The economy is in shambles and the politicians just keep lying", "likes": 445, "date": "2026-05-05"},
+    {"text": "Small businesses are closing every week in my city, its devastating", "likes": 321, "date": "2026-05-05"},
+    {"text": "Tax cuts for the rich while working people struggle to survive", "likes": 289, "date": "2026-05-06"},
+    {"text": "Housing costs are impossible for young people now, where do we live", "likes": 376, "date": "2026-05-06"},
+    {"text": "The opposition party is corrupt and incompetent, vote them all out", "likes": 234, "date": "2026-05-07"},
+    {"text": "Both parties are the same, just serving their corporate donors", "likes": 456, "date": "2026-05-07"},
+    {"text": "The election was rigged and everyone knows it but nobody says so", "likes": 189, "date": "2026-05-08"},
+    {"text": "We need new leadership that actually listens to ordinary citizens", "likes": 312, "date": "2026-05-08"},
+    {"text": "Politicians spend all their time on TV instead of solving problems", "likes": 267, "date": "2026-05-09"},
+    {"text": "I am proud of our nation and believe we will get through this together", "likes": 198, "date": "2026-05-09"},
+    {"text": "The media never reports the truth about what is really happening", "likes": 423, "date": "2026-05-10"},
+    {"text": "Young people are leaving the country because there is no future here", "likes": 334, "date": "2026-05-10"},
 ]
 
-if demo_btn:
-    st.info("Running in Demo Mode with sample comments...")
-    df_demo = pd.DataFrame(DEMO_COMMENTS)
-    df_demo = run_analysis(df_demo, load_sentiment_model(), load_classifier())
-    st.session_state.df = df_demo
-    st.session_state.expert_report = ""
+def run_demo():
+    demo_df = pd.DataFrame(DEMO_COMMENTS)
+    sentiment_model = load_sentiment_model()
+    classifier      = load_classifier()
+    return run_analysis(demo_df, sentiment_model, classifier)
 
-if load_btn:
-    saved = load_saved_data()
-    if not saved.empty:
-        st.session_state.df = saved
-        st.session_state.expert_report = ""
-        st.success(f"Loaded {len(saved)} saved comments.")
-    else:
-        st.warning("No saved data found.")
+def extract_video_id(url):
+    match = re.search(r"(?:v=|youtu\.be/)([^&\n?#]+)", url)
+    return match.group(1) if match else None
 
+# ─── Trigger Actions ────────────────────────────────────────────
 if fetch_btn:
     if not api_key:
-        st.sidebar.error("Please enter a YouTube API Key.")
+        st.error("Please enter your YouTube API Key.")
     elif not video_url:
-        st.sidebar.error("Please enter a Video URL.")
+        st.error("Please enter a YouTube Video URL.")
     else:
-        video_id = None
-        if "v=" in video_url:
-            video_id = video_url.split("v=")[-1].split("&")[0]
-        elif "youtu.be/" in video_url:
-            video_id = video_url.split("youtu.be/")[-1].split("?")[0]
+        video_id = extract_video_id(video_url)
         if not video_id:
-            st.sidebar.error("Could not extract video ID from URL.")
+            st.error("Could not parse video ID from URL.")
         else:
-            with st.spinner(f"Fetching up to {max_comments} comments..."):
-                df_new = fetch_comments(api_key, video_id, max_comments)
-            if not df_new.empty:
-                st.success(f"Fetched {len(df_new)} comments. Running analysis...")
-                df_new = run_analysis(df_new, load_sentiment_model(), load_classifier())
-                save_data(df_new)
-                st.session_state.df = df_new
+            with st.spinner("Fetching comments..."):
+                raw_df = fetch_comments(api_key, video_id, max_comments)
+            if raw_df.empty:
+                st.error("No comments fetched. Check your API key and video URL.")
+            else:
+                sentiment_model = load_sentiment_model()
+                classifier      = load_classifier()
+                st.session_state.df = run_analysis(raw_df, sentiment_model, classifier)
+                save_data(st.session_state.df)
                 st.session_state.expert_report = ""
+                st.success(f"✅ Fetched and analyzed {len(st.session_state.df)} comments.")
 
+if load_btn:
+    loaded = load_saved_data()
+    if loaded.empty:
+        st.warning("No saved data found.")
+    else:
+        st.session_state.df = loaded
+        st.session_state.expert_report = ""
+        st.success(f"✅ Loaded {len(loaded)} saved comments.")
+
+if demo_btn:
+    with st.spinner("Running demo analysis..."):
+        st.session_state.df = run_demo()
+    st.session_state.expert_report = ""
+    st.success("✅ Demo analysis complete!")
+
+# ─── Main Dashboard ─────────────────────────────────────────────
 df = st.session_state.df
 
 if df.empty:
     st.markdown("""
     <div class="empty-state">
-        <h2>👈 Get Started</h2>
-        <p>Enter a YouTube API Key and video URL in the sidebar,<br>
-        or click <strong>Run with Sample Data</strong> for a demo.</p>
+        <h2>📭 No Data Yet</h2>
+        <p>Enter a YouTube URL and API key in the sidebar, or run the demo to get started.</p>
     </div>
     """, unsafe_allow_html=True)
 else:
-    total          = len(df)
-    pos            = len(df[df["sentiment"] == "Positive"])
-    neg            = len(df[df["sentiment"] == "Negative"])
-    neu            = len(df[df["sentiment"] == "Neutral"])
-    cluster_counts = df["cluster"].value_counts()
-
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Comments", total)
-    k2.metric("Positive 🟢",    pos, f"↑ {pos/total*100:.0f}%")
-    k3.metric("Negative 🔴",    neg, f"↑ {neg/total*100:.0f}%")
-    k4.metric("Neutral ⚪",     neu, f"↑ {neu/total*100:.0f}%")
-    dominant  = cluster_counts.idxmax() if not cluster_counts.empty else "N/A"
-    dom_parts = dominant.split(" ", 1)
-    dom_label = dom_parts[1] if len(dom_parts) > 1 else dominant
-    k5.metric("Dominant Cluster", dom_label)
-    st.divider()
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown('<div class="chart-card">', unsafe_allow_html=True)
-        st.markdown("**Sentiment Distribution**")
-        fig_sent = px.pie(
-            names=["Positive", "Negative", "Neutral"],
-            values=[pos, neg, neu],
-            color=["Positive", "Negative", "Neutral"],
-            color_discrete_map=SENTIMENT_COLORS, hole=0.52
-        )
-        fig_sent.update_traces(
-            textposition="outside", textinfo="percent+label",
-            marker=dict(line=dict(color="#FFFFFF", width=2)),
-            pull=[0.02, 0.02, 0.02]
-        )
-        fig_sent.update_layout(showlegend=True)
-        fig_sent = styled(fig_sent, height=310)
-        st.plotly_chart(fig_sent, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col2:
-        st.markdown('<div class="chart-card">', unsafe_allow_html=True)
-        st.markdown("**Semantic Cluster Distribution**")
-        cc = df["cluster"].value_counts().reset_index()
-        cc.columns = ["Cluster", "Count"]
-        cc["Pct"]   = (cc["Count"] / cc["Count"].sum() * 100).round(1)
-        cc["Label"] = cc["Pct"].astype(str) + "%"
-        fig_cluster = px.bar(
-            cc, x="Count", y="Cluster", orientation="h",
-            color="Cluster", color_discrete_map=CLUSTER_COLORS, text="Label"
-        )
-        fig_cluster.update_traces(textposition="outside",
-                                   marker_line_color="#FFFFFF", marker_line_width=1.5)
-        fig_cluster.update_layout(showlegend=False)
-        fig_cluster = styled(fig_cluster, height=310)
-        fig_cluster.update_yaxes(categoryorder="total ascending")
-        st.plotly_chart(fig_cluster, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="chart-card">', unsafe_allow_html=True)
-    st.markdown("**Cluster x Sentiment Breakdown**")
-    cross = pd.crosstab(df["cluster"], df["sentiment"]).reset_index()
-    for c in ["Positive", "Negative", "Neutral"]:
-        if c not in cross.columns: cross[c] = 0
-    long_cross = cross.melt(id_vars="cluster", var_name="sentiment", value_name="count")
-    long_cross  = long_cross[long_cross["count"] > 0]
-    fig_stack   = px.bar(
-        long_cross, x="count", y="cluster",
-        color="sentiment", orientation="h", barmode="stack",
-        color_discrete_map=SENTIMENT_COLORS, text="count"
-    )
-    fig_stack.update_traces(textposition="inside", insidetextanchor="middle",
-                             marker_line_color="#FFFFFF", marker_line_width=1)
-    fig_stack = styled(fig_stack, height=280)
-    fig_stack.update_yaxes(categoryorder="total ascending")
-    st.plotly_chart(fig_stack, use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    if "date" in df.columns:
-        st.markdown('<div class="chart-card">', unsafe_allow_html=True)
-        st.markdown("**Activity Timeline by Cluster**")
-        timeline        = df.groupby(["date", "cluster"]).size().reset_index(name="count")
-        active_clusters = timeline["cluster"].nunique()
-        if active_clusters >= 2:
-            fig_time = px.line(timeline, x="date", y="count", color="cluster",
-                               color_discrete_map=CLUSTER_COLORS, markers=True)
-            fig_time.update_traces(line=dict(width=2.5), marker=dict(size=7))
-        else:
-            fig_time = px.bar(timeline, x="date", y="count", color="cluster",
-                              color_discrete_map=CLUSTER_COLORS)
-        fig_time = styled(fig_time, height=320)
-        fig_time.update_xaxes(title_text="Date")
-        fig_time.update_yaxes(title_text="Comments")
-        st.plotly_chart(fig_time, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+    # ── KPI Row ────────────────────────────────────────────────
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total Comments", f"{len(df):,}")
+    k2.metric("Positive", f"{round(len(df[df['sentiment']=='Positive'])/len(df)*100,1)}%",
+              delta=f"{len(df[df['sentiment']=='Positive'])} comments")
+    k3.metric("Negative", f"{round(len(df[df['sentiment']=='Negative'])/len(df)*100,1)}%",
+              delta=f"{len(df[df['sentiment']=='Negative'])} comments")
+    k4.metric("Neutral",  f"{round(len(df[df['sentiment']=='Neutral'])/len(df)*100,1)}%",
+              delta=f"{len(df[df['sentiment']=='Neutral'])} comments")
 
     st.divider()
-    st.subheader("🔍 Top Comments by Cluster")
-    tab1, tab2, tab3 = st.tabs(CLUSTER_NAMES)
-    SENT_ICON = {"Positive": "🟢", "Negative": "🔴", "Neutral": "⚪"}
-    for tab, cluster_name, css_cls in zip([tab1, tab2, tab3], CLUSTER_NAMES, CLUSTER_CSS):
-        with tab:
-            sub = df[df["cluster"] == cluster_name].copy()
-            if "likes" in sub.columns: sub = sub.sort_values("likes", ascending=False)
-            if sub.empty:
-                st.info("No comments in this cluster.")
-            for _, row in sub.head(8).iterrows():
-                icon      = SENT_ICON.get(row.get("sentiment", ""), "⚪")
-                likes_str = f"👍 {int(row['likes'])}" if "likes" in row and pd.notna(row["likes"]) else ""
-                conf_str  = f"Conf: {row.get('cluster_conf', '')}"
-                st.markdown(f"""
-                <div class="cluster-card {css_cls}">
-                    <p style="color:#0F172A; font-size:15px; margin:0 0 8px 0; line-height:1.5;">{row['text']}</p>
-                    <small style="color:#64748B; font-size:12px;">{icon} {row.get('sentiment','')} &nbsp;·&nbsp; {conf_str} &nbsp;·&nbsp; {likes_str}</small>
-                </div>
-                """, unsafe_allow_html=True)
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🗂️ Clusters", "📈 Trends", "🤖 Expert Report"])
 
-    st.divider()
-    st.subheader("📥 Export Results")
-    col_dl1, col_dl2 = st.columns(2)
-    with col_dl1:
-        csv_data = df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download Full CSV", csv_data,
-            "youtube_sentiment_results.csv", "text/csv", use_container_width=True)
-    with col_dl2:
-        summary     = df.groupby(["cluster", "sentiment"]).size().reset_index(name="count")
-        summary_csv = summary.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download Summary CSV", summary_csv,
-            "cluster_summary.csv", "text/csv", use_container_width=True)
+    # ── Tab 1: Overview ────────────────────────────────────────
+    with tab1:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown('<div class="chart-card">', unsafe_allow_html=True)
+            sent_counts = df["sentiment"].value_counts().reset_index()
+            sent_counts.columns = ["sentiment", "count"]
+            fig = px.pie(sent_counts, values="count", names="sentiment",
+                         color="sentiment", color_discrete_map=SENTIMENT_COLORS,
+                         title="Sentiment Distribution")
+            st.plotly_chart(styled(fig), use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+        with c2:
+            st.markdown('<div class="chart-card">', unsafe_allow_html=True)
+            clust_counts = df["cluster"].value_counts().reset_index()
+            clust_counts.columns = ["cluster", "count"]
+            fig2 = px.bar(clust_counts, x="cluster", y="count",
+                          color="cluster", color_discrete_map=CLUSTER_COLORS,
+                          title="Comments per Cluster")
+            fig2.update_layout(showlegend=False)
+            st.plotly_chart(styled(fig2), use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
 
-    # ═══════════════════════════════════════════════════════════
-    #  EXPERT ANALYSIS SECTION — Gemini 1.5 Flash (Free tier)
-    # ═══════════════════════════════════════════════════════════
-    st.divider()
-    st.subheader("🤖 Expert Analyst Report")
-    st.caption("Powered by Gemini 1.5 Flash · Compact prompt · Live retry countdown")
-
-    report_col, _ = st.columns([3, 1])
-    with report_col:
-        generate_btn = st.button(
-            "✨ Generate Expert Report",
-            type="primary",
-            use_container_width=True,
-            disabled=(not gemini_key),
-            help="Add your Gemini API Key in the sidebar to enable this feature."
-        )
-
-    if not gemini_key:
-        st.info("🔑 Add your free **Google Gemini API Key** in the sidebar to unlock the expert report.  \nGet it free at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)")
-
-    if generate_btn and gemini_key:
-        with st.spinner("🤖 Analyst is reading the data and writing the report..."):
-            try:
-                report = build_expert_report(df, gemini_key, video_context)
-                st.session_state.expert_report = report
-            except Exception as e:
-                st.error(f"Gemini API error: {e}")
-
-    if st.session_state.expert_report:
-        report_text = st.session_state.expert_report
-        dominant_cl = df["cluster"].value_counts().idxmax() if not df.empty else "General"
-        st.markdown('<div class="report-card">', unsafe_allow_html=True)
-        st.markdown(f"""
-        <div class="report-meta">
-            <span class="report-badge">✦ Gemini 1.5 Flash</span>
-            <span class="report-badge" style="background:#7C3AED;">Senior Analyst</span>
-            <span style="color:#64748B; font-size:13px;">{total} comments · {len(df['cluster'].unique())} clusters · dominant: {dominant_cl}</span>
-        </div>
-        """, unsafe_allow_html=True)
-        st.markdown(report_text)
-        st.markdown('</div>', unsafe_allow_html=True)
+        # ── Download ──────────────────────────────────────────
+        st.divider()
         st.download_button(
-            label="⬇️ Download Report (.md)",
-            data=report_text.encode("utf-8"),
-            file_name="expert_analyst_report.md",
-            mime="text/markdown",
-            use_container_width=False
+            "⬇️ Download Full Dataset (CSV)",
+            df.to_csv(index=False).encode("utf-8"),
+            "youtube_comments_analysis.csv", "text/csv"
         )
+
+    # ── Tab 2: Clusters ────────────────────────────────────────
+    with tab2:
+        for i, cn in enumerate(CLUSTER_NAMES):
+            sub = df[df["cluster"] == cn]
+            if sub.empty: continue
+            css = CLUSTER_CSS[i]
+            pos = len(sub[sub["sentiment"] == "Positive"])
+            neg = len(sub[sub["sentiment"] == "Negative"])
+            top_comment = sub.sort_values("likes", ascending=False).iloc[0]["text"] \
+                          if "likes" in sub.columns else sub.iloc[0]["text"]
+            st.markdown(f"""
+            <div class="cluster-card {css}">
+                <b>{cn}</b> — {len(sub)} comments
+                &nbsp;&nbsp;✅ {pos} positive &nbsp; ❌ {neg} negative<br>
+                <small style="color:#64748B">Top comment: {str(top_comment)[:180]}…</small>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.divider()
+        # Sentiment × Cluster heatmap
+        st.markdown("#### Sentiment × Cluster Heatmap")
+        pivot = df.pivot_table(index="cluster", columns="sentiment",
+                               values="text", aggfunc="count", fill_value=0)
+        fig3 = px.imshow(pivot, text_auto=True, aspect="auto",
+                         color_continuous_scale="Blues", title="Comment Count Heatmap")
+        st.plotly_chart(styled(fig3, height=280), use_container_width=True)
+
+    # ── Tab 3: Trends ──────────────────────────────────────────
+    with tab3:
+        if "date" in df.columns:
+            daily = df.groupby(["date", "sentiment"]).size().reset_index(name="count")
+            fig4  = px.line(daily, x="date", y="count", color="sentiment",
+                            color_discrete_map=SENTIMENT_COLORS,
+                            title="Daily Comment Volume by Sentiment",
+                            markers=True)
+            st.plotly_chart(styled(fig4, height=360), use_container_width=True)
+
+            daily_c = df.groupby(["date", "cluster"]).size().reset_index(name="count")
+            fig5 = px.area(daily_c, x="date", y="count", color="cluster",
+                           color_discrete_map=CLUSTER_COLORS,
+                           title="Daily Cluster Volume")
+            st.plotly_chart(styled(fig5, height=320), use_container_width=True)
+        else:
+            st.info("Date information not available for trend analysis.")
+
+    # ── Tab 4: Expert Report ───────────────────────────────────
+    with tab4:
+        st.markdown("### 🤖 Gemini Expert Analysis")
+        st.caption(
+            "Uses **gemini-1.5-flash** with a structured 6-block payload (~700–1,200 tokens). "
+            "Exponential back-off handles RPM, TPM, and RPD limits automatically."
+        )
+        gen_btn = st.button("✨ Generate Expert Report", type="primary")
+
+        if gen_btn:
+            if not gemini_key:
+                st.error("Please enter your Gemini API Key in the sidebar.")
+            else:
+                with st.spinner("Generating expert analysis…"):
+                    try:
+                        report = build_expert_report(df, gemini_key, video_context)
+                        st.session_state.expert_report = report
+                    except RuntimeError as e:
+                        st.error(str(e))
+                    except Exception as e:
+                        st.error(f"Unexpected error: {e}")
+
+        if st.session_state.expert_report:
+            st.markdown('<div class="report-card">', unsafe_allow_html=True)
+            st.markdown(f"""
+            <div class="report-meta">
+                <span class="report-badge">AI ANALYSIS</span>
+                <span style="color:#64748B;font-size:13px;">
+                    Model: gemini-1.5-flash &nbsp;·&nbsp;
+                    Dataset: {len(df):,} comments &nbsp;·&nbsp;
+                    Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown(st.session_state.expert_report)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            st.download_button(
+                "⬇️ Download Report (Markdown)",
+                st.session_state.expert_report.encode("utf-8"),
+                "expert_report.md", "text/markdown"
+            )
