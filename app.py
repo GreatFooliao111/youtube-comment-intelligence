@@ -54,12 +54,19 @@ def load_classifier():
         model="facebook/bart-large-mnli"
     )
 
-# ─── Helper: Clean Text ────────────────────────────────────────
+# ─── Helper: Clean Text ─────────────────────────────────────────
+# FIX: returns None if text becomes empty after cleaning
 def clean_text(text):
+    if not isinstance(text, str):
+        return None
     text = re.sub(r"http\S+", "", text)
     text = re.sub(r"@\w+", "", text)
+    # Keep letters, digits, basic punctuation — strip pure-emoji / symbol comments
     text = re.sub(r"[^\w\s\'!?.,]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
+    # Minimum 3 characters to be useful for NLP
+    if len(text) < 3:
+        return None
     return text[:512]
 
 # ─── Helper: Fetch YouTube Comments ────────────────────────────
@@ -99,21 +106,37 @@ CLUSTER_NAMES  = ["🪖 Military/Hawkish", "💰 Economic/Domestic", "🗳️ El
 CLUSTER_COLORS = ["#ef4444", "#f59e0b", "#3b82f6"]
 
 def classify_cluster(text, classifier):
-    result = classifier(text, CLUSTER_LABELS, multi_label=False)
-    top_idx = result["scores"].index(max(result["scores"]))
-    return CLUSTER_NAMES[top_idx], round(result["scores"][top_idx], 3)
+    # FIX: guard against None or empty strings
+    if not text or not text.strip():
+        return CLUSTER_NAMES[2], 0.0  # default fallback bucket
+    try:
+        result = classifier(text, CLUSTER_LABELS, multi_label=False)
+        top_idx = result["scores"].index(max(result["scores"]))
+        return CLUSTER_NAMES[top_idx], round(result["scores"][top_idx], 3)
+    except Exception:
+        return CLUSTER_NAMES[2], 0.0
 
 # ─── Helper: Run Full Analysis ──────────────────────────────────
 def run_analysis(df, sentiment_model, classifier):
     df["clean"] = df["text"].apply(clean_text)
+
+    # FIX: drop rows where clean is None/empty — they break the models
+    before = len(df)
+    df = df[df["clean"].notna() & (df["clean"].str.strip() != "")].copy()
+    dropped = before - len(df)
+    if dropped > 0:
+        st.info(f"ℹ️ {dropped} comments were skipped (emoji-only, links, or too short).")
+
     with st.spinner("Running sentiment analysis..."):
         sentiments = sentiment_model(df["clean"].tolist(), batch_size=16)
         df["sentiment"] = [s["label"].capitalize() for s in sentiments]
         df["sentiment_score"] = [round(s["score"], 3) for s in sentiments]
+
     with st.spinner("Classifying semantic clusters..."):
         results = [classify_cluster(t, classifier) for t in df["clean"]]
         df["cluster"] = [r[0] for r in results]
         df["cluster_conf"] = [r[1] for r in results]
+
     return df
 
 # ─── Helper: Save/Load CSV ─────────────────────────────────────
@@ -201,15 +224,7 @@ if demo_btn:
     df_demo = pd.DataFrame(DEMO_COMMENTS)
     sentiment_model = load_sentiment_model()
     classifier = load_classifier()
-    df_demo["clean"] = df_demo["text"].apply(clean_text)
-    with st.spinner("Running sentiment analysis..."):
-        sentiments = sentiment_model(df_demo["clean"].tolist())
-        df_demo["sentiment"] = [s["label"].capitalize() for s in sentiments]
-        df_demo["sentiment_score"] = [round(s["score"], 3) for s in sentiments]
-    with st.spinner("Classifying semantic clusters..."):
-        results = [classify_cluster(t, classifier) for t in df_demo["clean"]]
-        df_demo["cluster"] = [r[0] for r in results]
-        df_demo["cluster_conf"] = [r[1] for r in results]
+    df_demo = run_analysis(df_demo, sentiment_model, classifier)
     st.session_state.df = df_demo
 
 if load_btn:
